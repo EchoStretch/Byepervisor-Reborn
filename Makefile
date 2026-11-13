@@ -39,7 +39,7 @@ all: $(ELF)
 $(PAYLOAD_HDR): $(PAYLOAD_DIR)/break_hv.c $(PAYLOAD_DIR)/entry.S $(PAYLOAD_DIR)/link.ld
 	sh $(PAYLOAD_DIR)/build.sh
 
-$(ELF): $(PAYLOAD_HDR) main.c kdlsym.c khook.c paging.c util.c dump.c
+$(ELF): $(PAYLOAD_HDR) main.c kdlsym.c khook.c resume_hook_1140.c paging.c util.c dump.c
 	$(CC) $(CFLAGS) -o $@ $(filter %.c,$^)
 
 clean:
